@@ -18,6 +18,14 @@ export class LlmChunkingStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
+    // DynamoDB table for idempotency
+    const idempotencyTable = new dynamodb.Table(this, "IdempotencyTable", {
+      partitionKey: { name: "id", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: "expiration",
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     // S3 buckets
     const rejectedChunksBucket = new s3.Bucket(this, "RejectedChunksBucket", {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -97,6 +105,7 @@ export class LlmChunkingStack extends cdk.Stack {
         INGESTED_BUCKET_NAME: ingestedChunksBucket.bucketName,
         CHUNK_QUEUE_URL: chunkQueue.queueUrl,
         DLQ_URL: dlq.queueUrl,
+        IDEMPOTENCY_TABLE: idempotencyTable.tableName,
       },
     });
 
@@ -133,6 +142,7 @@ export class LlmChunkingStack extends cdk.Stack {
     // Permissions
     jobTable.grantReadWriteData(llmLambda);
     jobTable.grantReadWriteData(ingestionLambda);
+    idempotencyTable.grantReadWriteData(llmLambda);
     rejectedChunksBucket.grantWrite(llmLambda);
     ingestedChunksBucket.grantWrite(llmLambda);
     textractOutputBucket.grantReadWrite(ingestionLambda);

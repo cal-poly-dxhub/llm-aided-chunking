@@ -2,20 +2,35 @@ import json
 import os
 import traceback
 from typing import Dict, Any, Optional
+import datetime
 import boto3
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from aws_lambda_powertools.utilities.parser import parse
 from aws_lambda_powertools.utilities.parser.models import SqsModel
+from aws_lambda_powertools.utilities.idempotency import (
+    idempotent_function,
+    IdempotencyConfig,
+)
+from aws_lambda_powertools.utilities.idempotency.persistence import (
+    DynamoDBPersistenceLayer,
+)
 from tenacity import retry, stop_after_delay, wait_exponential, before_sleep_log
 import logging
 import instructor
 from pydantic import BaseModel
 
-from models import QueueMessage, JobConfig, Chunk
+from models import QueueMessage, JobConfig, Chunk, upload_chunk_to_s3
 from prompt import CHUNK_CLASSIFICATION_PROMPT
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Idempotency configuration
+persistence = DynamoDBPersistenceLayer(table_name=os.environ["IDEMPOTENCY_TABLE"])
+config = IdempotencyConfig(
+    event_key_jmespath="Records[0].messageId",
+    expires_after_seconds=3600,
+)
 
 dynamodb = boto3.client("dynamodb")
 s3 = boto3.client("s3")
@@ -74,6 +89,8 @@ def reject_chunk(chunk: Chunk, reason: str):
     body = {
         "chunk": chunk.model_dump(),
         "reason": reason,
+        "by": "Ingestion function",  # vs. LLM classifier
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
     s3.put_object(
@@ -112,6 +129,44 @@ def read_config(job_id: str) -> JobConfig:
 
     item = {k: deserializer.deserialize(v) for k, v in response["Item"].items()}
     return JobConfig(**item)
+
+
+@idempotent_function(
+    data_keyword_argument="event",
+    config=config,
+    persistence_store=persistence,
+)
+def process_event(event):
+    sqs_event = parse(event, model=SqsModel)
+    record = sqs_event.Records[0]
+    message_data = json.loads(record.body)
+    queue_message = QueueMessage(**message_data)
+
+    config = read_config(queue_message.job_id)
+
+    if config.abort:
+        logger.info(f"Job {queue_message.job_id} is aborted, failing message")
+        return {"statusCode": 500}
+
+    chunk = queue_message.chunk
+    logger.info(f"Processing chunk {chunk.chunk_id} for job {queue_message.job_id}")
+
+    classification = classify_chunk(chunk.text)
+    logger.info(f"Classification result: {classification}")
+
+    if classification.accept:
+        upload_chunk_to_s3(chunk, os.environ["INGESTED_BUCKET_NAME"])
+        logger.info(f"Chunk {chunk.chunk_id} accepted and uploaded")
+    else:
+        upload_chunk_to_s3(chunk, os.environ["REJECTED_BUCKET_NAME"])
+        logger.info(f"Chunk {chunk.chunk_id} rejected: {classification.reason}")
+
+    return {
+        "processed": True,
+        "messageId": record.messageId,
+        "chunk_id": chunk.chunk_id,
+        "accepted": classification.accept,
+    }
 
 
 def handler(event: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
@@ -160,3 +215,19 @@ def handler(event: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Handler error: {traceback.format_exc()}")
         return {"statusCode": 500}
+
+
+def handler(event: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        result = process_event(event=event)
+        return {
+            "statusCode": 200,
+            "body": json.dumps(result),
+        }
+    except Exception as e:
+        logger.error(f"Error processing event: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)}),
+        }
