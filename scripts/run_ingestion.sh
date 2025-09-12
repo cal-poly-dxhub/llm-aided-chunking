@@ -29,6 +29,7 @@ import json
 import sys
 sys.path.append('lambda/ingestion')
 sys.path.append('lambda/layers/textract')
+sys.path.append('lambda/layers/shared')
 from handler import lambda_handler
 
 event = json.loads(sys.stdin.read())
@@ -39,6 +40,7 @@ else
     echo "Running in cloud..."
     aws lambda invoke \
         --function-name "$LAMBDA_FUNCTION_NAME" \
+        --cli-binary-format raw-in-base64-out \
         --payload "$EVENT" \
         response.json
     cat response.json
