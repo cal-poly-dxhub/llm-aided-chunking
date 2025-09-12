@@ -14,11 +14,9 @@ from aws_utils import *
 from table_tools import *
 from reason_codes import *
 from kb_utils import (
-    Chunk,
-    ChunkMetadata,
     queue_chunks_for_second_look,
 )
-from models import upload_chunk_to_s3
+from models import upload_chunk_to_s3, Chunk, ChunkMetadata
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
@@ -217,7 +215,7 @@ def chunk_document(
     numbered_pattern = re.compile(r"^\d+\.", re.MULTILINE)
 
     doc_id = os.path.basename(file)
-    logging_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logging_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
     def flush_chunk(chunks_list, chunk):
         if chunk["content"]:
@@ -426,7 +424,7 @@ def extract_clean_plaintext(
                 log_removed_chunk(
                     chunk,
                     f"{chunk_num}_{chunk_idx}",
-                    HARD_LOWER_THRESHOLD,
+                    "HARD_LOWER_THRESHOLD",
                 )
                 continue
 
@@ -472,7 +470,7 @@ def process_pdf_from_s3(
     if not TEXTRACT_OUTPUT_BUCKET:
         raise ValueError("TEXTRACT_OUTPUT_BUCKET environment variable is not set.")
 
-    logging_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logging_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     textract_output_path = None
     try:
         document, local_pdf_path, textract_output_path = extract_textract_data(
@@ -539,8 +537,10 @@ def process_pdf_from_s3(
 
         # Save removed chunks
         removed_chunks_data = []
-        for chunk in removed_chunks:
-            removed_chunks_data.append(json.dumps(chunk, indent=2))
+        for reason, chunks in removed_chunks.items():
+            for chunk in chunks:
+                chunk_with_reason = {**chunk, "removal_reason": reason}
+                removed_chunks_data.append(json.dumps(chunk_with_reason, indent=2))
 
         removed_chunks_content = "\n".join(removed_chunks_data)
         save_data(
@@ -552,31 +552,48 @@ def process_pdf_from_s3(
             secondary_bucket,
         )
 
-        # Save final chunks
-        final_chunks_data = []
-        for idx, chunk in enumerate(cleaned_text_chunks):
-            record = {
-                "chunk_id": id_from_content(chunk),
-                "text": chunk,
-                "metadata": {
-                    "doc_id": doc_chunks["doc_id"],
-                    "source": s3_file_path,
-                    "source_url": document_url,
-                    "chunk_index": idx,
-                    "total_chunks": len(cleaned_text_chunks),
-                },
-            }
-            final_chunks_data.append(json.dumps(record, indent=2))
+        # Save final chunks individually to S3
+        if not debug_mode and primary_bucket:
+            for idx, chunk in enumerate(cleaned_text_chunks):
+                chunk_obj = Chunk(
+                    chunk_id=id_from_content(chunk),
+                    text=chunk,
+                    metadata=ChunkMetadata(
+                        doc_id=doc_chunks["doc_id"],
+                        source=s3_file_path,
+                        source_url=document_url,
+                        chunk_index=idx,
+                        total_chunks=len(cleaned_text_chunks),
+                    ),
+                )
+                upload_chunk_to_s3(chunk_obj, primary_bucket)
 
-        final_chunks_content = "\n".join(final_chunks_data)
-        save_data(
-            final_chunks_content,
-            f"{os.path.basename(s3_file_path)}_{logging_timestamp}.jsonl",
-            "final_chunks",
-            debug_mode,
-            primary_bucket,
-            secondary_bucket,
-        )
+        # Save final chunks for debug mode
+        if debug_mode:
+            final_chunks_data = []
+            for idx, chunk in enumerate(cleaned_text_chunks):
+                record = {
+                    "chunk_id": id_from_content(chunk),
+                    "text": chunk,
+                    "metadata": {
+                        "doc_id": doc_chunks["doc_id"],
+                        "source": s3_file_path,
+                        "source_url": document_url,
+                        "chunk_index": idx,
+                        "total_chunks": len(cleaned_text_chunks),
+                    },
+                }
+                final_chunks_data.append(json.dumps(record, indent=2))
+
+            final_chunks_content = "\n".join(final_chunks_data)
+            save_data(
+                final_chunks_content,
+                f"{os.path.basename(s3_file_path)}_{logging_timestamp}.jsonl",
+                "final_chunks",
+                debug_mode,
+                primary_bucket,
+                secondary_bucket,
+            )
 
         chunk_map = []
         for idx, chunk in enumerate(cleaned_text_chunks):
@@ -665,6 +682,7 @@ def lambda_handler(event, context):
             ),
         }
     except Exception as e:
+        logger.error(f"Error processing document: {str(e)}", exc_info=True)
         return {
             "statusCode": 500,
             "body": json.dumps(

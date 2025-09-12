@@ -112,7 +112,7 @@ export class LlmChunkingStack extends cdk.Stack {
     // Ingestion script lambda
     const ingestionLambda = new lambda.Function(this, "IngestionLambda", {
       runtime: lambda.Runtime.PYTHON_3_13,
-      handler: "handler.handler",
+      handler: "handler.lambda_handler",
       code: lambda.Code.fromAsset("lambda/ingestion", {
         bundling: {
           image: lambda.Runtime.PYTHON_3_13.bundlingImage,
@@ -124,7 +124,7 @@ export class LlmChunkingStack extends cdk.Stack {
         },
       }),
       timeout: cdk.Duration.minutes(15),
-      memorySize: 512,
+      memorySize: 4096,
       layers: [sharedLayer, textractLayer],
       environment: {
         JOB_TABLE_NAME: jobTable.tableName,
@@ -144,7 +144,9 @@ export class LlmChunkingStack extends cdk.Stack {
     jobTable.grantReadWriteData(ingestionLambda);
     idempotencyTable.grantReadWriteData(llmLambda);
     rejectedChunksBucket.grantWrite(llmLambda);
+    rejectedChunksBucket.grantWrite(ingestionLambda);
     ingestedChunksBucket.grantWrite(llmLambda);
+    ingestedChunksBucket.grantWrite(ingestionLambda);
     textractOutputBucket.grantReadWrite(ingestionLambda);
     chunkQueue.grantConsumeMessages(llmLambda);
     chunkQueue.grantSendMessages(ingestionLambda);
@@ -170,6 +172,20 @@ export class LlmChunkingStack extends cdk.Stack {
           textractOutputBucket.bucketArn,
           `${textractOutputBucket.bucketArn}/*`,
         ],
+      }),
+    );
+
+    // Grant ingestion lambda Textract permissions
+    ingestionLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "textract:StartDocumentAnalysis",
+          "textract:GetDocumentAnalysis",
+          "textract:StartDocumentTextDetection",
+          "textract:GetDocumentTextDetection",
+        ],
+        resources: ["*"],
       }),
     );
 
