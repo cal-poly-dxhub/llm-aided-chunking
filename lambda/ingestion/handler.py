@@ -16,9 +16,9 @@ from reason_codes import *
 from kb_utils import (
     Chunk,
     ChunkMetadata,
-    upload_chunk_to_s3,
     queue_chunks_for_second_look,
 )
+from models import upload_chunk_to_s3
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
