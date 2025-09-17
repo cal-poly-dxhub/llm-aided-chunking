@@ -10,6 +10,7 @@ class ChunkMetadata(BaseModel):
     source_url: str
     chunk_index: int
     total_chunks: int
+    source_id: Optional[str] = None
 
 
 class Chunk(BaseModel):
@@ -54,6 +55,9 @@ def upload_chunk_to_s3(chunk: Chunk, target_bucket: str) -> None:
             "total_chunks": chunk.metadata.total_chunks,
         }
     }
+    
+    if chunk.metadata.source_id:
+        metadata_content["metadataAttributes"]["source_id"] = chunk.metadata.source_id
 
     s3_client.put_object(
         Bucket=target_bucket,

@@ -14,7 +14,7 @@ from aws_utils import *
 from table_tools import *
 from reason_codes import *
 from kb_utils import (
-    queue_chunks_for_second_look,
+    run_second_look,
 )
 from models import upload_chunk_to_s3, Chunk, ChunkMetadata
 
@@ -46,7 +46,7 @@ def save_to_s3(bucket, key, data):
 
 def id_from_content(content):
     """Generate a deterministic ID from chunk content using SHA-256 hash."""
-    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def save_data(
@@ -366,12 +366,6 @@ def extract_clean_plaintext(
         real_words = [w for w in words if re.search(r"[aeiouAEIOU]", w) and len(w) > 2]
         return len(real_words) < max(3, len(words) * 0.4)
 
-    def passes_soft_threshold_criteria() -> Tuple[bool, str]:
-        # TODO: Send to sqs queue here and forget instead of returning something.
-        # NOTE: don't log these chunks in removed_chunks of the handler; these get
-        # logged when they're removed during queue processing.
-        return False, "Does not pass soft threshold criteria"
-
     def log_removed_chunk(chunk, chunk_num, reason, section_id=None):
         if reason not in removed_chunks:
             removed_chunks[reason] = []
@@ -429,12 +423,10 @@ def extract_clean_plaintext(
                 continue
 
             if total_words < SOFT_LOWER_THRESHOLD:
-                passes, reason = passes_soft_threshold_criteria()
-                if not passes:
-                    log_removed_chunk(
-                        chunk, f"{chunk_num}_{chunk_idx}", SOFT_THRESHOLD_FAIL
-                    )
-                    continue
+                log_removed_chunk(
+                    chunk, f"{chunk_num}_{chunk_idx}", SOFT_THRESHOLD_FAIL
+                )
+                continue
 
             if avg_sentence_length < 6:
                 log_removed_chunk(
@@ -535,23 +527,6 @@ def process_pdf_from_s3(
                 debug_mode,
             )
 
-        # Save removed chunks
-        removed_chunks_data = []
-        for reason, chunks in removed_chunks.items():
-            for chunk in chunks:
-                chunk_with_reason = {**chunk, "removal_reason": reason}
-                removed_chunks_data.append(json.dumps(chunk_with_reason, indent=2))
-
-        removed_chunks_content = "\n".join(removed_chunks_data)
-        save_data(
-            removed_chunks_content,
-            f"{os.path.basename(s3_file_path)}_{logging_timestamp}.jsonl",
-            "removed",
-            debug_mode,
-            primary_bucket,
-            secondary_bucket,
-        )
-
         # Save final chunks individually to S3
         if not debug_mode and primary_bucket:
             for idx, chunk in enumerate(cleaned_text_chunks):
@@ -590,6 +565,23 @@ def process_pdf_from_s3(
                 final_chunks_content,
                 f"{os.path.basename(s3_file_path)}_{logging_timestamp}.jsonl",
                 "final_chunks",
+                debug_mode,
+                primary_bucket,
+                secondary_bucket,
+            )
+
+            # Save removed chunks for debug mode only
+            removed_chunks_data = []
+            for reason, chunks in removed_chunks.items():
+                for chunk in chunks:
+                    chunk_with_reason = {**chunk, "removal_reason": reason}
+                    removed_chunks_data.append(json.dumps(chunk_with_reason, indent=2))
+
+            removed_chunks_content = "\n".join(removed_chunks_data)
+            save_data(
+                removed_chunks_content,
+                f"{os.path.basename(s3_file_path)}_{logging_timestamp}.jsonl",
+                "removed",
                 debug_mode,
                 primary_bucket,
                 secondary_bucket,
@@ -640,13 +632,14 @@ def lambda_handler(event, context):
         primary_bucket = event.get("primary_output_bucket")
         secondary_bucket = event.get("secondary_output_bucket")
         target_bucket = event.get("target_bucket")
-        job_id = event.get("job_id")
-        queue_url = os.getenv("CHUNK_QUEUE_URL")
+        # job_id = event.get("job_id")
+        # queue_url = os.getenv("CHUNK_QUEUE_URL")
 
         logger.info(f"Processing document: s3://{bucket_name}/{s3_key}")
         logger.info(f"Target bucket: {target_bucket}, Debug mode: {debug_mode}")
         logger.info(f"Intermediate textract bucket: {TEXTRACT_OUTPUT_BUCKET}")
 
+        # Process chunks with first-pass heuristics
         chunk_map, rejected_chunks = process_pdf_from_s3(
             bucket_name,
             s3_key,
@@ -666,9 +659,72 @@ def lambda_handler(event, context):
                 )
                 upload_chunk_to_s3(chunk, target_bucket)
 
-        # Queue rejected chunks for classification
-        if job_id and queue_url and not debug_mode:
-            queue_chunks_for_second_look(rejected_chunks, queue_url, job_id)
+        # Process rejected chunks with LLM classification
+        second_look_map, final_rejected = run_second_look(
+            rejected_chunks,
+        )
+
+        # Log LLM removed chunks and processing errors
+        llm_removed_chunks = {}
+        processing_error_chunks = {}
+        
+        for reason, chunks in final_rejected.items():
+            if reason == "PROCESSING_ERROR":
+                processing_error_chunks[reason] = chunks
+            elif reason not in rejected_chunks:  # New rejections from LLM
+                llm_removed_chunks[reason] = chunks
+
+        # Save LLM removed chunks
+        if llm_removed_chunks:
+            logging_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            llm_removed_data = []
+            for reason, chunks in llm_removed_chunks.items():
+                for chunk in chunks:
+                    chunk_with_reason = {**chunk, "removal_reason": reason}
+                    llm_removed_data.append(json.dumps(chunk_with_reason, indent=2))
+            
+            llm_removed_content = "\n".join(llm_removed_data)
+            save_data(
+                llm_removed_content,
+                f"{os.path.basename(s3_key)}_{logging_timestamp}.jsonl",
+                "removed_llm",
+                debug_mode,
+                primary_bucket,
+                secondary_bucket,
+            )
+
+        # Save processing error chunks
+        if processing_error_chunks:
+            logging_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            error_data = []
+            for reason, chunks in processing_error_chunks.items():
+                for chunk in chunks:
+                    chunk_with_reason = {**chunk, "removal_reason": reason}
+                    error_data.append(json.dumps(chunk_with_reason, indent=2))
+            
+            error_content = "\n".join(error_data)
+            save_data(
+                error_content,
+                f"{os.path.basename(s3_key)}_{logging_timestamp}.jsonl",
+                "processing_error",
+                debug_mode,
+                primary_bucket,
+                secondary_bucket,
+            )
+
+        # Upload accepted chunks from second look
+        if target_bucket and not debug_mode:
+            for chunk_data in second_look_map:
+                chunk = Chunk(
+                    chunk_id=chunk_data["chunk_id"],
+                    text=chunk_data["text"],
+                    metadata=ChunkMetadata(**chunk_data["metadata"]),
+                )
+                upload_chunk_to_s3(chunk, target_bucket)
+
+        for chunk_data in second_look_map:
+            chunk_map.append(chunk_data)
+        rejected_chunks = final_rejected
 
         return {
             "statusCode": 200,
